@@ -166,3 +166,13 @@ slurm_grid
 .obsidian
 private/
 python -m hipposlam_sf.dmlab.txt
+
+# SLURM / command-line logs
+*.log
+sf_khushi/dmlab/command_line/
+# training outputs and checkpoints
+train_dir/
+*.pth
+*.log
+sf_khushi/dmlab/command_line/
+train_dir/

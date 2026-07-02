@@ -482,9 +482,10 @@ class DepthEncoder(Encoder):
         input_ch = 1
         log.debug("Num input channels for depth encoder: %d", input_ch)
 
-        if cfg.encoder_conv_architecture == "resnet_impala" or cfg.encoder_conv_architecture == "pretrained_resnet":
-            # configuration from the IMPALA paper
+        if cfg.encoder_conv_architecture in ("resnet_impala", "pretrained_resnet"):
             resnet_conf = [[16, 2], [32, 2], [32, 2]]
+        elif cfg.encoder_conv_architecture.startswith("layer2_resnet18"):
+            resnet_conf = None  # not used downstream, just here for compat
         else:
             raise NotImplementedError(f"Unknown resnet architecture {cfg.encoder_conv_architecture}")
 

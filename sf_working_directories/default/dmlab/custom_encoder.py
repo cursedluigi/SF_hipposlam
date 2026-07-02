@@ -482,12 +482,13 @@ class DepthEncoder(Encoder):
         input_ch = 1
         log.debug("Num input channels for depth encoder: %d", input_ch)
 
-        if cfg.encoder_conv_architecture == "resnet_impala" or cfg.encoder_conv_architecture == "pretrained_resnet":
-            # configuration from the IMPALA paper
+        if cfg.encoder_conv_architecture in ("resnet_impala", "pretrained_resnet"):
             resnet_conf = [[16, 2], [32, 2], [32, 2]]
+        elif cfg.encoder_conv_architecture.startswith("layer2_resnet18"):
+            resnet_conf = None  # unused; depth path is just an Upsample
         else:
             raise NotImplementedError(f"Unknown resnet architecture {cfg.encoder_conv_architecture}")
-
+        
         curr_input_channels = input_ch
         self.downsample = nn.Upsample(size=(1, 10))
 
@@ -753,7 +754,89 @@ class HipposlamEncoder(Encoder):
 
     def get_out_size(self) -> int:
         return self.encoder_out_size
+    
+    
+class ResNet18Layer2(Encoder):
+    """
+    Use ResNet-18 up to layer2 (i.e., conv1/bn1/relu/maxpool -> layer1 -> layer2),
+    then a downsample (AvgPool2d) and flatten.
+    """
+    def __init__(self, cfg, obs_space, pretrained=True, fixed=True, down_k=3, down_s=2, down_p=1):
+        super().__init__(cfg)
 
+        in_ch = obs_space.shape[0]
+        if in_ch != 3:
+            raise NotImplementedError("FixedResNet18EarlyEncoder only supports 3-channel inputs.")
+
+        # --- Weights handling across torchvision versions
+        self._use_legacy_pretrained = False
+        if pretrained:
+            if hasattr(models, "ResNet18_Weights"):
+                WeightsEnum = models.ResNet18_Weights
+                weights_arg = WeightsEnum.IMAGENET1K_V1
+            else:
+                weights_arg = None
+                self._use_legacy_pretrained = True
+        else:
+            weights_arg = None
+
+        # --- Load ResNet-18
+        if self._use_legacy_pretrained:
+            resnet = models.resnet18(pretrained=pretrained)
+        else:
+            resnet = models.resnet18(weights=weights_arg)
+
+        # --- Freeze if requested
+        if fixed:
+            for p in resnet.parameters():
+                p.requires_grad = False
+            resnet.eval()
+
+        # --- Build the feature trunk up to layer2
+        stem = nn.Sequential(
+            resnet.conv1,   # 64, stride=2, kernel=7
+            resnet.bn1,
+            resnet.relu,
+            resnet.maxpool, # /4 spatial after stem (given stride/pool)
+        )
+        self.features = nn.Sequential(
+            stem,           # -> [N, 64, H/4, W/4] roughly
+            resnet.layer1,  # -> [N, 64, ...]
+            resnet.layer2,  # -> [N, 128, ...]
+        )
+
+        # --- Lightweight downsample (adjustable)
+        self.downsample = nn.AvgPool2d(kernel_size=down_k, stride=down_s, padding=down_p)
+
+        # --- ImageNet per-channel mean/std (for Normalize-like behavior)
+        mean = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32)[:, None, None]
+        std  = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32)[:, None, None]
+        self.register_buffer("mn_mean", mean)
+        self.register_buffer("mn_std",  std)
+
+        # --- Compute encoder_out_size dynamically from obs_space
+        _, H, W = obs_space.shape
+        with torch.no_grad():
+            dummy = torch.zeros(1, in_ch, H, W)
+            y = (dummy - self.mn_mean) / self.mn_std
+            y = self.features(y)
+            y = self.downsample(y)
+            self.encoder_out_size = y.numel()  # batch=1
+
+        # --- Move to device
+        device = "cuda" if getattr(cfg, "device", "").lower() in ("cuda", "gpu") else "cpu"
+        self.model_to_device(device)
+
+    def forward(self, x):
+        # If upstream obs are raw [0,1], this matches ImageNet normalization.
+        # If upstream obs are already zero-mean/unit-std, consider disabling that upstream norm.
+        x = (x - self.mn_mean) / self.mn_std
+        x = self.features(x)      # [N, 128, H', W']
+        x = self.downsample(x)    # [N, 128, H'', W'']
+        return torch.flatten(x, 1)
+
+    def get_out_size(self) -> int:
+        return self.encoder_out_size
 
 def make_img_encoder(cfg: Config, obs_space: ObsSpace) -> Encoder:
     """Make (most likely convolutional) encoder for image-based observations."""
@@ -802,6 +885,8 @@ def make_img_encoder(cfg: Config, obs_space: ObsSpace) -> Encoder:
         return encoder
     elif cfg.encoder_conv_architecture.startswith("mobilenet"):
         return FixedMobileNetSmallEncoder(cfg, obs_space)
+    elif cfg.encoder_conv_architecture.startswith("layer2_resnet18"):
+        return ResNet18Layer2(cfg, obs_space) #change
     else:
         raise NotImplementedError(f"Unknown convolutional architecture {cfg.encoder_conv_architecture}")
 
