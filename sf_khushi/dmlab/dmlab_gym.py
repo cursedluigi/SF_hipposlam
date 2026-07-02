@@ -511,7 +511,7 @@ class DmlabGymEnv_custom(gym.Env):
 
         if not terminated:
             obs_dict = self.format_obs_dict(self.dmlab.observations())
-            obs_dict["prev_action"] = np.array([self.prev_action], dtype=np.int32)  # Change
+            obs_dict["prev_action"] = np.array([action], dtype=np.int32)  # Change
             # Change: update previous action after using it in the observation
             self.last_observation = obs_dict
             self.prev_action = action                                   # Change
