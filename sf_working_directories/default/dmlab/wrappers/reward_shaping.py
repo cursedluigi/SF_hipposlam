@@ -42,4 +42,5 @@ class DmlabRewardShapingWrapper(gym.Wrapper):
                 (10000 - self.episode_length) / 10000 * score
             )
             # log.info(f'Episode Extra Stats: {info["episode_extra_stats"]}')
+            info["episode_extra_stats"][f"{level_name_key}_success"] = float(score > 0)
         return obs, rew, terminated, truncated, info

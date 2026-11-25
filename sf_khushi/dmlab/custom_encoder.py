@@ -297,10 +297,12 @@ class DGProjection_batchnorm_relu(nn.Module):
         self.batchnorm1d = nn.BatchNorm1d(out_features, affine=False, momentum=0.1)
         self.activation = nn.ReLU()
         self.intercept = intercept
+        self.pre_threshold = None  # Store the pre-threshold values for batch loss 
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.linear(x)  # Shape: [batch_size, out_features]
         x = self.batchnorm1d(x)
+        self.pre_threshold = x
         # Replace logits with softmaxed probabilities.
         x = self.activation(x - self.intercept)
 

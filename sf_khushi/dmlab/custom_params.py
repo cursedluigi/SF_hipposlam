@@ -67,6 +67,8 @@ def add_hipposlam_env_args(parser: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--DG_novelty", default=None, type=float, help="batch novelty novelty threshold to store a new pattern"
     )
+    p.add_argument("--DG_batch_loss", default=False, type=str2bool, help="Use DG batch loss on silent features (pre-threshold)")
+    p.add_argument("--DG_batch_loss_coeff", default=1.0, type=float, help="Weight of the DG batch loss")
     # p.add_argument("--dense", default=None, type=bool, help="whether encoder gives additional dense output")
     p.add_argument("--head_l1_coef", default=None, type=float, help="L1 penalty to encoder output")
     p.add_argument(
