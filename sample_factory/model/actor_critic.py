@@ -104,6 +104,9 @@ class ActorCritic(nn.Module, Configurable):
         if self.returns_normalizer is not None:
             for k, v in running_mean_std_summaries(self.returns_normalizer).items():
                 s[f"returns_{k}"] = v
+        for m in self.modules():
+            if m is not self and hasattr(m, "_last_forward_summaries"):
+                s.update(m.summaries())
         return s
 
     def action_distribution(self):

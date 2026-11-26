@@ -707,6 +707,13 @@ class HipposlamEncoder(Encoder):
             tmp_out_size += bypass_features
             log.info(f"using bypass, dim {bypass_features}")
 
+        # Action-conditioned CA3->DG feedback: append one-hot(prev action) as the LAST columns,
+        # for the core only (not fed into DG, not part of the bypass). Independent of use_prev_action.
+        self.fb_n_actions = int(getattr(cfg, "dg_feedback_n_actions", 0) or 0)
+        if self.fb_n_actions > 0:
+            tmp_out_size += self.fb_n_actions
+            log.info(f"dg feedback: appending one-hot prev action for the core, dim {self.fb_n_actions}")
+
         self.encoder_out_size = tmp_out_size
         self.cpu_device = torch.device("cpu")
 
@@ -794,7 +801,21 @@ class HipposlamEncoder(Encoder):
             dense_out = self.dense(x)
             tmp_out = torch.cat((tmp_out, dense_out), dim=1)
 
+        if self.fb_n_actions > 0:
+            tmp_out = torch.cat((tmp_out, self._prev_action_onehot(obs_dict).to(tmp_out.device)), dim=1)
+
         return tmp_out
+
+    def _prev_action_onehot(self, obs_dict):
+        """One-hot of obs_dict["prev_action"] for the feedback core. Negative values (no previous
+        action, if the wrapper marks episode start that way) give an all-zero row, which the core
+        treats as "use the shared feedback"."""
+        prev_action = obs_dict["prev_action"]
+        prev_action = prev_action.squeeze(-1) if prev_action.dim() > 1 else prev_action
+        prev_action = prev_action.long()
+        valid = (prev_action >= 0).unsqueeze(-1).float()
+        onehot = F.one_hot(prev_action.clamp_min(0), num_classes=self.fb_n_actions).float()
+        return onehot * valid
 
     def get_out_size(self) -> int:
         return self.encoder_out_size

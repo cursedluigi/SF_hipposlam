@@ -69,6 +69,12 @@ def add_hipposlam_env_args(parser: argparse.ArgumentParser) -> None:
     )
     p.add_argument("--DG_batch_loss", default=False, type=str2bool, help="Use DG batch loss on silent features (pre-threshold)")
     p.add_argument("--DG_batch_loss_coeff", default=1.0, type=float, help="Weight of the DG batch loss")
+    p.add_argument("--dg_feedback_n_actions", default=0, type=int,
+                help="BypassDGFeedback core: number of actions for action-conditioned CA3->DG feedback (0 = shared feedback)")
+    p.add_argument("--dg_feedback_pred_loss", default=False, type=str2bool,
+                help="BypassDGFeedback core: train the feedback to predict the DG input (aux loss)")
+    p.add_argument("--dg_feedback_pred_loss_coeff", default=0.1, type=float,
+                help="Weight of the DG feedback prediction loss")
     # p.add_argument("--dense", default=None, type=bool, help="whether encoder gives additional dense output")
     p.add_argument("--head_l1_coef", default=None, type=float, help="L1 penalty to encoder output")
     p.add_argument(

@@ -51,6 +51,8 @@ class CustomRNN(RNNBase):
             self.rank = kwargs.pop("rank", 1)
         # Action-conditioned feedback (keyword only). 0 = original shared feedback.
         self.n_actions = int(kwargs.pop("n_actions", 0))
+        # Optional auxiliary loss: feedback at t predicts the real DG input x_t (keyword only).
+        self.use_feedback_pred_loss = bool(kwargs.pop("feedback_pred_loss", False))
         if self.nonlinearity == "tanh":
             mode = "RNN_TANH"
         elif self.nonlinearity == "relu":
@@ -98,6 +100,21 @@ class CustomRNN(RNNBase):
         else:
             self.lr_row_action = None
 
+        # Per-feature affine readout used ONLY by the prediction loss:
+        #     x̂_t = pred_scale * raw_feedback_t + pred_bias
+        # The feedback direction is unit-norm, so its scale cannot match DG's; this readout
+        # absorbs scale and offset (the offline ridge's D(a) f(x) + b with f = LayerNorm).
+        # The RL path still uses tanh(raw_feedback) unchanged.
+        if self.use_feedback_pred_loss:
+            self.pred_scale = Parameter(torch.ones(self.rank, **factory_kwargs))
+            self.pred_bias = Parameter(torch.zeros(self.rank, **factory_kwargs))
+        else:
+            self.pred_scale = None
+            self.pred_bias = None
+        # Scalar loss from the last grad-enabled forward; the learner adds
+        #     loss = loss + coeff * core.feedback_pred_loss
+        self.feedback_pred_loss: Optional[Tensor] = None
+
         # add to log
         self._feedback_forward_count = 0
 
@@ -106,7 +123,7 @@ class CustomRNN(RNNBase):
 
         # Per-timestep finite/bound checks force a CPU-GPU sync every step.
         # Keep True while debugging; set False for full runs.
-        self.debug_checks = True
+        self.debug_checks = False
 
         self._fixed_weights_set = False
         self._warned_unfixed = False
@@ -299,15 +316,7 @@ class CustomRNN(RNNBase):
         norms = mats.flatten(1).norm(p=2, dim=1).clamp_min(1e-8)
         return mats / norms[:, None, None]
 
-    def _bounded_feedback_step(
-        self,
-        x_t,
-        h_prev,
-        W_in,
-        W_hh_base,
-        a_prev=None,
-        action_directions=None,
-    ):
+    def _raw_feedback(self, h_prev, a_prev=None, action_directions=None):
         h_context = F.layer_norm(
             h_prev,
             normalized_shape=(self.hidden_size,),
@@ -321,15 +330,50 @@ class CustomRNN(RNNBase):
                 eps=1e-8,
             )
 
-            raw_feedback = h_context @ direction.T
-        else:
-            # Row index into action_directions: 0 if no action given, else 1 + argmax.
-            has_action = a_prev.sum(dim=-1) > 0.5
-            idx = torch.where(has_action, a_prev.argmax(dim=-1) + 1, torch.zeros_like(has_action, dtype=torch.long))
-            # Feedback under every action, then pick each row's own: (B, n_actions + 1, rank).
-            raw_all = torch.einsum("bh,kdh->bkd", h_context, action_directions)
-            raw_feedback = raw_all.gather(1, idx[:, None, None].expand(-1, 1, raw_all.shape[-1])).squeeze(1)
+            return h_context @ direction.T
 
+        # Row index into action_directions: 0 if no action given, else 1 + argmax.
+        has_action = a_prev.sum(dim=-1) > 0.5
+        idx = torch.where(has_action, a_prev.argmax(dim=-1) + 1, torch.zeros_like(has_action, dtype=torch.long))
+        # Feedback under every action, then pick each row's own: (B, n_actions + 1, rank).
+        raw_all = torch.einsum("bh,kdh->bkd", h_context, action_directions)
+        return raw_all.gather(1, idx[:, None, None].expand(-1, 1, raw_all.shape[-1])).squeeze(1)
+
+    def _feedback_pred_sq_error(self, x_t, h_prev, a_prev, action_directions, eps: float = 1e-6):
+        """
+        Summed squared error of x̂_t = pred_scale * raw_feedback(h_{t-1}, a_{t-1}) + pred_bias
+        against the real DG input x_t, and the number of rows counted.
+
+        Stop-gradients: x_t (target) and h_{t-1} are detached, so the loss trains only the
+        feedback map (lr_row, lr_row_action) and the readout, never the CA3 state or DG.
+        Rows with a zero previous state (episode start) are excluded.
+        """
+        h_det = h_prev.detach()
+        raw = self._raw_feedback(h_det, a_prev, action_directions)
+        pred = raw * self.pred_scale + self.pred_bias
+        valid = (h_det.norm(p=2, dim=-1) > eps).to(pred.dtype)
+        sq = ((pred - x_t.detach()) ** 2).sum(dim=-1)
+        return (sq * valid).sum(), valid.sum()
+
+    def _set_feedback_pred_loss(self, sq_errors, counts):
+        if not (self.use_feedback_pred_loss and torch.is_grad_enabled()) or len(sq_errors) == 0:
+            self.feedback_pred_loss = None
+            return
+        total = torch.stack(sq_errors).sum()
+        n = torch.stack(counts).sum().clamp_min(1.0) * self.rank
+        self.feedback_pred_loss = total / n  # mean squared error per DG feature
+        self._last_forward_summaries["rnn/feedback_pred_mse"] = float(self.feedback_pred_loss.detach())
+
+    def _bounded_feedback_step(
+        self,
+        x_t,
+        h_prev,
+        W_in,
+        W_hh_base,
+        a_prev=None,
+        action_directions=None,
+    ):
+        raw_feedback = self._raw_feedback(h_prev, a_prev, action_directions)
         feedback = torch.tanh(raw_feedback)
 
         effective_dg_input = x_t + feedback
@@ -432,6 +476,10 @@ class CustomRNN(RNNBase):
         feedback_abs_max = []
         empirical_gain = []
 
+        compute_pred_loss = self.use_feedback_pred_loss and torch.is_grad_enabled()
+        pred_sq_errors = []
+        pred_counts = []
+
         for t in range(T):
             x_t, a_prev = self._split_input(input_batched[:, t, :])
             h_prev = h
@@ -483,11 +531,17 @@ class CustomRNN(RNNBase):
 
             empirical_gain.append(self._state_norm_ratio(h_prev, h_new))
 
+            if compute_pred_loss:
+                sq, cnt = self._feedback_pred_sq_error(x_t, h_prev, a_prev, action_directions)
+                pred_sq_errors.append(sq)
+                pred_counts.append(cnt)
+
         self._set_last_forward_summaries(
             state_abs_max=state_abs_max,
             feedback_abs_max=feedback_abs_max,
             empirical_gain=empirical_gain,
         )
+        self._set_feedback_pred_loss(pred_sq_errors, pred_counts)
 
         output_batched = torch.stack(outputs, dim=1)
         hidden = h.unsqueeze(0)
@@ -499,7 +553,7 @@ class CustomRNN(RNNBase):
             if not torch.isfinite(hidden).all():
                 raise RuntimeError("Bounded-feedback final hidden state contains NaN or Inf")
 
-        if self._feedback_forward_count % 50 == 0:
+        if self._feedback_forward_count % 5000 == 0:
             with torch.no_grad():
                 state_per_t = torch.stack(state_abs_max)
                 feedback_per_t = torch.stack(feedback_abs_max)
@@ -617,6 +671,10 @@ class CustomRNN(RNNBase):
         feedback_abs_max = []
         empirical_gain = []
 
+        compute_pred_loss = self.use_feedback_pred_loss and torch.is_grad_enabled()
+        pred_sq_errors = []
+        pred_counts = []
+
         offset = 0
 
         for t, batch_size_tensor in enumerate(batch_sizes):
@@ -678,6 +736,11 @@ class CustomRNN(RNNBase):
 
             empirical_gain.append(self._state_norm_ratio(h_prev, h_new))
 
+            if compute_pred_loss:
+                sq, cnt = self._feedback_pred_sq_error(x_t, h_prev, a_prev, action_directions)
+                pred_sq_errors.append(sq)
+                pred_counts.append(cnt)
+
             offset += active_batch_size
 
         self._set_last_forward_summaries(
@@ -685,6 +748,7 @@ class CustomRNN(RNNBase):
             feedback_abs_max=feedback_abs_max,
             empirical_gain=empirical_gain,
         )
+        self._set_feedback_pred_loss(pred_sq_errors, pred_counts)
 
         if offset != data.shape[0]:
             raise RuntimeError(
@@ -711,7 +775,7 @@ class CustomRNN(RNNBase):
             unsorted_indices,
         )
 
-        if self._feedback_forward_count % 50 == 0:
+        if self._feedback_forward_count % 5000 == 0:
             with torch.no_grad():
                 state_per_t = torch.stack(state_abs_max)
                 feedback_per_t = torch.stack(feedback_abs_max)
